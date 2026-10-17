@@ -22,9 +22,6 @@ if (!fs.existsSync(TEMP_DIR)) {
 
 app.use(cors());
 app.use(express.static(path.join(__dirname, 'public')));
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
 app.use(express.json({ limit: '10mb' }));
 
 const upload = multer();
@@ -33,6 +30,9 @@ const VOICE_MAP = {
   piseth: 'km-KH-PisethNeural',   // Male
   sreymom: 'km-KH-SreymomNeural'  // Female
 };
+
+// Helper delay utility
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function toRate(speed) {
   const percent = Math.round((Number(speed) - 1) * 100);
@@ -122,25 +122,40 @@ function parseSrt(srtText) {
   return items;
 }
 
-async function generateSegment(text, voiceName, speed, pitch, outputPath) {
+// Generate segment with automatic retry & exponential backoff on 429 rate limits
+async function generateSegment(text, voiceName, speed, pitch, outputPath, retries = 3) {
   const voice = VOICE_MAP[voiceName] || VOICE_MAP.piseth;
-  const tts = new EdgeTTS({
-    voice,
-    lang: 'km-KH',
-    outputFormat: 'audio-24khz-48kbitrate-mono-mp3',
-    rate: toRate(speed),
-    pitch: toPitch(pitch),
-    timeout: 60000
-  });
 
-  await tts.ttsPromise(text, outputPath);
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const tts = new EdgeTTS({
+        voice,
+        lang: 'km-KH',
+        outputFormat: 'audio-24khz-48kbitrate-mono-mp3',
+        rate: toRate(speed),
+        pitch: toPitch(pitch),
+        timeout: 60000
+      });
 
-  // Guarantee the file was actually written and is non-empty
-  if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size < 100) {
-    throw new Error(`TTS synthesis produced an empty file for text: "${text}"`);
+      await tts.ttsPromise(text, outputPath);
+
+      if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size < 100) {
+        throw new Error(`TTS synthesis produced an empty file for text: "${text}"`);
+      }
+
+      return outputPath;
+    } catch (err) {
+      const isRateLimit = err.message && (err.message.includes('429') || err.message.includes('Unexpected server response'));
+
+      if (isRateLimit && attempt < retries) {
+        const waitTime = attempt * 1500;
+        console.warn(`[RateLimit 429] Retrying TTS segment in ${waitTime}ms (attempt ${attempt}/${retries})...`);
+        await sleep(waitTime);
+      } else {
+        throw err;
+      }
+    }
   }
-
-  return outputPath;
 }
 
 function getAudioDuration(filePath) {
@@ -244,6 +259,9 @@ app.post('/api/generate-srt', upload.none(), async (req, res) => {
       const segRawPath = path.join(TEMP_DIR, `${jobId}_raw_${i}.mp3`);
       await generateSegment(item.text, selectedVoice, globalSpeed, pitch, segRawPath);
       tempFiles.push(segRawPath);
+
+      // Throttling: Pause 250ms between requests to respect Edge TTS limits
+      await sleep(250);
 
       let finalSegPath = segRawPath;
       let speechDuration = await getAudioDuration(segRawPath);
