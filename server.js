@@ -90,7 +90,7 @@ function parseSrt(srtText) {
         .replace(/\[female\]|\(female\)|\[f\]|\(f\)/gi, '')
         .trim();
 
-      // Skip lines that have no pronounceable characters (only punctuation/symbols/spaces)
+      // Skip lines that have no pronounceable characters
       const cleanCheck = textLines.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?"'«»‹›—–…\s]/g, '').trim();
       if (!cleanCheck) {
         console.warn(`[Skip] Line #${lines[0] || bIdx + 1} has no vocalizable characters: "${textLines}"`);
@@ -122,8 +122,8 @@ function parseSrt(srtText) {
   return items;
 }
 
-// Generate segment with automatic retry & exponential backoff on 429 rate limits
-async function generateSegment(text, voiceName, speed, pitch, outputPath, retries = 3) {
+// Generate segment with automatic retry & exponential backoff on 200, 429, and dropouts
+async function generateSegment(text, voiceName, speed, pitch, outputPath, retries = 4) {
   const voice = VOICE_MAP[voiceName] || VOICE_MAP.piseth;
 
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -145,11 +145,18 @@ async function generateSegment(text, voiceName, speed, pitch, outputPath, retrie
 
       return outputPath;
     } catch (err) {
-      const isRateLimit = err.message && (err.message.includes('429') || err.message.includes('Unexpected server response'));
+      const msg = err.message || '';
+      const isRetryable =
+        msg.includes('429') ||
+        msg.includes('200') ||
+        msg.includes('Unexpected server response') ||
+        msg.includes('socket hang up') ||
+        msg.includes('ETIMEDOUT') ||
+        msg.includes('ECONNRESET');
 
-      if (isRateLimit && attempt < retries) {
-        const waitTime = attempt * 1500;
-        console.warn(`[RateLimit 429] Retrying TTS segment in ${waitTime}ms (attempt ${attempt}/${retries})...`);
+      if (isRetryable && attempt < retries) {
+        const waitTime = attempt * 2000; // wait 2s, 4s, 6s...
+        console.warn(`[TTS Retry] Encountered "${msg}". Retrying in ${waitTime}ms (attempt ${attempt}/${retries})...`);
         await sleep(waitTime);
       } else {
         throw err;
@@ -260,8 +267,8 @@ app.post('/api/generate-srt', upload.none(), async (req, res) => {
       await generateSegment(item.text, selectedVoice, globalSpeed, pitch, segRawPath);
       tempFiles.push(segRawPath);
 
-      // Throttling: Pause 250ms between requests to respect Edge TTS limits
-      await sleep(250);
+      // Throttling: 600ms breathing space to respect WebSocket connection limits
+      await sleep(600);
 
       let finalSegPath = segRawPath;
       let speechDuration = await getAudioDuration(segRawPath);
